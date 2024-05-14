@@ -1,8 +1,8 @@
-# neuro
+# neuro readme
 - Uses CamCAN data of 606 participants with power resolution of 0.5
- - Currently uses non-continuous definitions of bands from Brainstorm
- - BEFORE Averaging: each subject (row) holds power readings of 0-149.5 (300 total) for each ROI (68 total)
-    => size = 606 x 20800
+- Currently uses non-continuous definitions of bands from Brainstorm
+- BEFORE Averaging: each subject (row) holds power readings of 0-149.5 (300 total) for each ROI (68 total)
+-  size = 606 x 20800
  - AFTER Averaging: each subject (row) holds a power reading for each (band x ROI) combination (408 total)
     => size = 606 x 408
 
