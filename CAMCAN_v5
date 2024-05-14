@@ -1,0 +1,462 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Dec 18 16:25:15 2023
+
+@author: jzoldan
+"""
+
+# Import necessary packages
+import numpy as np
+import pandas as pd
+import time
+import matplotlib.pyplot as plt
+from scipy.stats import norm
+from scipy.stats import shapiro
+
+
+
+start_read = time.time()
+
+# Read in the raw CamCAN data
+df_raw = pd.read_csv('CAMCAN_Broadband_PSD_justRest.csv', header=None)
+
+end_read = time.time()
+
+# Read in the ROI names (same order as in CamCAN data)
+df_ROIs = pd.read_csv('ROIs.csv', header=None)
+
+ROI_list = list(df_ROIs.iloc[0, :])
+
+print('Reading took: ', (end_read - start_read))
+
+"""
+Brainstorm Band Defaults:
+Delta => (2,4)
+Theta => (5,7)
+Alpha => (8,12)
+Beta => (15,29)
+Gamma1 => (30,59)
+Gamma2 => (60,90)
+TODO: create a gamma+ band but keep in 0.5 increments
+
+CAMCAN has 68 regions of interest (ROIs) and increments of 0.5
+
+Delta (2Hz) -> index 4, 5 columns
+Theta (5Hz) -> index 10, 5 columns
+Alpha (8Hz) -> index 16, 9 columns
+Beta (15Hz) -> index 30, 29 columns
+Gamma1 (30Hz) -> index 60, 59 columns
+Gamma2 bands (60Hz) -> index 120, 61 columns
+
+"""
+
+# Keys are band IDs
+# 1st Value is band start column
+# 2nd Value is number of columns for that particular band
+
+
+def define_band_boundaries(delta=(2, 4), theta=(5, 7), alpha=(8, 12), beta=(15, 29), gamma1=(30, 59), gamma2=(60, 90)):
+    """
+    :param delta: delta boundaries (inclusive)
+    :param theta: theta boundaries (inclusive)
+    :param alpha: alpha boundaries (inclusive)
+    :param beta: beta boundaries (inclusive)
+    :param gamma1: gamma1 boundaries (inclusive)
+    :param gamma2: gamma 2 boundaries (inclusive)
+    :return: dictionary with:
+                keys = band names
+                values = length 2 arrays
+                    value[0] = start index of band for Region #1
+                    value[1] = number of columns within bounds
+    """
+    old_bands = [delta, theta, alpha, beta, gamma1, gamma2]
+    names = ['delta', 'theta', 'alpha', 'beta', 'gamma1', 'gamma2']
+
+    new_bands = {}
+
+    for band, name in zip(old_bands, names):
+        new_start = band[0]*2
+        nb_cols = ((band[1] - band[0]) / 0.5) + 1
+
+        new_bands[name] = [new_start, nb_cols]
+
+    return new_bands
+
+# Uses defaults from Brainstorm
+bandsDict = define_band_boundaries()
+print(define_band_boundaries())
+
+dfAvgColTitles = []
+dfAvgCols = []
+
+nb_bands = len(bandsDict)
+
+start_avg = time.time()
+
+# Average within each band definition to generate one recording per feature
+for iRegion in range(0, 68):
+    for iBand in bandsDict.keys():
+        iStart = bandsDict[iBand][0] + (300*iRegion)
+        iCols = bandsDict[iBand][1]
+        iEnd = iCols + iStart
+
+        iAvg = df_raw.iloc[:, iStart:iEnd].mean(axis=1)
+        dfAvgCols.append(list(iAvg))
+        iColTitle = ROI_list[iRegion] + ", Band: " + iBand
+        dfAvgColTitles.append(iColTitle)
+
+
+
+# Build the new dataframe in one go
+dfAvg = pd.DataFrame(dfAvgCols)
+dfAvg = dfAvg.transpose()
+dfAvg.columns = dfAvgColTitles
+
+end_avg = time.time()
+print("Averaging took: " + str(end_avg - start_avg))
+
+def reshape_df(array, rois=68):
+    """
+    :param array: pandas dataframe in form [Subject, PSDxROI]
+    :param rois: number of ROIs
+    :return: pandas dataframe in form [Subject, PSD, ROI]
+    """
+    [x,y] = array.shape
+    cols = y // rois
+    newarray = np.zeros((x,cols,rois))
+    for i,j in enumerate(np.arange(0,y,cols)):
+        newarray[:,:,i]=array.iloc[:,j:j+cols]
+        
+    return newarray
+
+
+dfAvg2 = reshape_df(dfAvg, rois=68)
+
+means_along_ROIs = np.mean(dfAvg2, axis=2)
+
+dfAvg3 = dfAvg.copy(deep=True)
+
+'''
+Option #1 => Z-score power values by subtracting the average of that band across all ROIs 
+'''
+for participant in range(606):
+    start = 0
+    for region in range(68):
+        original = np.array(dfAvg.iloc[participant, start:start+6])
+        band_avgs = np.array(means_along_ROIs[participant, :])
+        
+        fixed_readings = original - band_avgs
+        
+        dfAvg3.iloc[participant, start:start+6] = fixed_readings
+        
+        start += 6
+
+dfAvg4 = dfAvg.copy(deep=True)
+
+'''
+Option #2 => Normalize each PSD by dividing each feature by the sum of power across all bands and ROIs for 
+that participant
+'''
+
+participant_sums = dfAvg.sum(axis=1)
+for participant in range(606):
+    original = np.array(dfAvg.iloc[participant, :])
+    participant_sum = participant_sums.iloc[participant]
+    normalized = original / participant_sum
+
+    dfAvg4.iloc[participant, :] = normalized
+
+
+'''
+Read in epileptic patient data
+'''
+
+# Include patient data here, expected dimensions are in read me
+df_epilepsy = pd.read_csv('patientA.csv', header=None, names=bandsDict.keys())
+
+means_along_ROIs_ep = df_epilepsy.mean(axis=0)
+
+# Normalize the epilepsy data using option #2
+epilepsy_sum = df_epilepsy.sum().sum()
+df_epilepsy2 = df_epilepsy / epilepsy_sum
+
+# Adjust patient values using option #1
+for band in range(6):
+    df_epilepsy.iloc[:,band] = df_epilepsy.iloc[:,band] - means_along_ROIs_ep.iloc[band]
+
+
+def show_distribution(iFeature):
+    """
+    Function to display histogram of values and corresponding Normal curve
+    :param iFeature: feature name or index
+    :return: None
+    """
+    # Check if given feature is an index or a column title
+    if type(iFeature) == str:
+        feat_index = dfAvg.columns.index(iFeature)
+        feat_name = iFeature
+    else:
+        feat_index = iFeature
+        feat_name = dfAvg.columns[feat_index]
+
+    # Extract values from given feature
+    feat_vals = dfAvg.iloc[:, feat_index]
+    # Plot histogram
+    plt.hist(feat_vals, density=True)
+
+    # Generate Normal Curve
+    mu = means.iloc[feat_index]
+    sigma = stdevs.iloc[feat_index]
+    xmin, xmax = plt.xlim()
+    x = np.linspace(xmin - 1, xmax + 1, 100)
+    prob = norm.pdf(x, mu, sigma)
+    plt.plot(x, prob, 'k')
+    plt.title('Distribution for ' + feat_name + ' and fitted normal PDF')
+    plt.show()
+
+
+# Raw value means and standard deviations
+means = dfAvg.mean(axis=0)
+stdevs = dfAvg.std(axis=0)
+
+def is_statistically_significant(raw_value, mean, stdev, alpha=0.05):
+    """
+    :param raw_value: subject's raw power reading for a feature
+    :param mean: the mean of all readings for a feature
+    :param stdev: the standard deviation of all readings for a feature
+    :param alpha: desired minimum significance level (default = 0.05)
+    :return: True if statistically significant and False otherwise
+    """
+    alpha /= 2
+    z_score = (raw_value - mean) / stdev
+    z_critical = norm.ppf(1-alpha, loc=mean, scale=stdev)
+
+    if abs(z_score) > abs(z_critical):
+        return True
+    else:
+        return False
+    
+def is_statistically_significant_no_model_dist(test_value, values, alpha=0.05):
+    
+    alpha /= 2
+    
+    q_right = 100 - (100*alpha)
+    q_left = 100 - q_right
+    
+    critical_value_right = np.percentile(values, q_right)
+    critical_value_left = np.percentile(values, q_left)
+    
+    if test_value > critical_value_right:
+        return test_value - critical_value_right
+    
+    elif test_value < critical_value_left:
+        return test_value - critical_value_left
+    else:
+        return 0
+
+
+
+def is_statistically_significant_no_model(test_value, values, alpha=0.05):
+    """
+    Tests if value is statistically significant under no model assumption
+    :param test_value: subject's power value for a given feature
+    :param values: all power values for a given feature
+    :param alpha: significance value
+    :return: True if subject is statistically significant for a given feature
+             False otherwise
+    """
+
+    alpha /= 2
+
+    # Define 2.5th and 97.5th percentiles
+    q_right = 100 - (100*alpha)
+    q_left = 100 - q_right
+
+    critical_value_right = np.percentile(values, q_right)
+    critical_value_left = np.percentile(values, q_left)
+
+    if test_value > critical_value_right or test_value < critical_value_left:
+        return True
+    else:
+        return False
+
+
+def test_normality(feature, log_values=False):
+    values = dfAvg.loc[:, feature]
+    if log_values:
+        values = np.log(values)
+    stat, p = shapiro(values)
+
+    return p
+
+
+def test_subject_deviance_per_roi(subject, alpha=0.05, model=True, logged=False):
+    """
+    Function to test a subject across all features
+    :param subject: index of subject
+    :param alpha: significance level
+    :return: list with number of deviant features per ROI
+    """
+
+    # Initialize list to store deviances
+    deviance = np.zeros(68)
+
+    # Loop through all features
+    for iRegion in range(68):
+        for iBand in range(nb_bands):
+
+            # Extract feature index
+            iFeature = iBand + (iRegion * nb_bands)
+            iRaw = dfAvg.iloc[subject, iFeature]
+            iValues = dfAvg.iloc[:, iFeature]
+
+            if is_statistically_significant_no_model(test_value=iRaw, values=iValues, alpha=alpha):
+                deviance[iRegion] += 1
+
+    return deviance
+
+def test_epilepsy_deviance_per_roi(alpha=0.05):
+    
+    deviance = np.zeros(68)
+    
+    for iRegion in range(68):
+        for iBand in range(nb_bands):
+            
+            iFeature = iBand + (iRegion * nb_bands)
+            iRaw = df_epilepsy2.iloc[iRegion, iBand]
+            iValues = dfAvg4.iloc[:, iFeature]
+            
+            distance = is_statistically_significant_no_model_dist(test_value=iRaw, values=iValues)
+            deviance[iRegion] += distance
+    
+    return deviance
+
+def test_epilepsy_deviance_per_feat(alpha=0.05):
+    
+    deviance = np.zeros(408)
+    
+    feat_index = 0
+    
+    for roi in range(68):
+        for band in range(nb_bands):
+            
+            iRaw = df_epilepsy2.iloc[roi, band]
+            iValues = dfAvg4.iloc[:,band+(roi*nb_bands)]
+            
+            distance = is_statistically_significant_no_model_dist(test_value=iRaw, values=iValues)
+            deviance[feat_index] += distance
+            feat_index += 1
+            
+    return deviance
+
+def test_subject_deviance_per_feat(subject, alpha=0.05, model=True, logged=False):
+    deviance = np.zeros(408)
+
+    for iFeature in range(408):
+
+        iRaw = dfAvg.iloc[subject, iFeature]
+        iValues = dfAvg.iloc[:, iFeature]
+
+        if is_statistically_significant_no_model_dist(test_value=iRaw, values=iValues, alpha=alpha):
+            deviance[iFeature] += 1
+
+    return deviance
+
+
+subject_deviance_list = []
+subject_deviance_cols = []
+for x in range(1, 69):
+    subject_deviance_cols.append("Region #"+str(x))
+
+
+# Test normality of distributions
+normalities = []
+for iFeature in dfAvg.columns:
+    normalities.append(test_normality(iFeature, log_values=False))
+
+
+norms_labels = zip(normalities, dfAvg.columns)
+sorted_norms_tup = sorted(norms_labels, key=lambda x:x[0], reverse=True)
+
+sorted_norms = [item[0] for item in sorted_norms_tup]
+sorted_labels = [item[1] for item in sorted_norms_tup]
+
+
+
+plt.bar(sorted_labels[:50], height=sorted_norms[:50])
+plt.xlabel('Feature')
+plt.ylabel('p-value')
+plt.title('Shapiro-Wilk test results')
+plt.xticks(rotation=45, ha='right')
+plt.tight_layout()
+plt.show()
+#
+# print('Percentage of features which pass normality: ', len([value for value in normalities if value > 0.05]))
+
+
+
+regions = np.arange(1, 69)
+
+'''
+Test epilepsy patient
+'''
+
+epilepsy_dev = test_epilepsy_deviance_per_roi(0.05)
+print('Number of features below 2.5th percentile', len([item for item in epilepsy_dev if item < 0]))
+print('Number of features above 97.5th percentile', len([item for item in epilepsy_dev if item > 0]))
+print('Number of healthy features', len([item for item in epilepsy_dev if item == 0]))
+
+epilepsy_csv = pd.DataFrame([ROI_list, epilepsy_dev])
+
+# This will save the deviance values for each ROI for the epilepsy patient
+epilepsy_csv.to_csv('patientA_ROI-vals.csv', index=False, header=False)
+
+print('#ROIs with score 6: ', len([score for score in epilepsy_dev if score == 6]))
+print('#ROIs with score 5: ', len([score for score in epilepsy_dev if score == 5]))
+print('#ROIs with score 4: ', len([score for score in epilepsy_dev if score == 4]))
+print('#ROIs with score 3: ', len([score for score in epilepsy_dev if score == 3]))
+print('#ROIs with score 2: ', len([score for score in epilepsy_dev if score == 2]))
+print('#ROIs with score 1: ', len([score for score in epilepsy_dev if score == 1]))
+print('#ROIs with score 0: ', len([score for score in epilepsy_dev if score == 0]))
+
+
+epilepsy_dev_tup = zip(epilepsy_dev, ROI_list)
+sorted_epilepsy = sorted(epilepsy_dev_tup, reverse=True)
+sorted_dev = [item[0] for item in sorted_epilepsy]
+sorted_roi = [item[1] for item in sorted_epilepsy]
+
+plt.bar(x=sorted_roi, height=sorted_dev, color='red')
+plt.xlabel('Feature')
+plt.ylabel('Abnormality')
+plt.title('Abnormality of Features using detailed scoring (Patient B)')
+plt.xticks(rotation=45, ha='right')
+plt.tight_layout()
+plt.show()
+
+'''
+The below commented out code is meant to test the normative controls using the algorithm
+'''
+
+# for iSubject in range(606):
+#     subject_deviance_list.append(test_subject_deviance_per_roi(iSubject, model=False, logged=False))
+#     # print('Done subject', (iSubject+1))
+
+# df_deviance = pd.DataFrame(subject_deviance_list, columns=subject_deviance_cols)
+#
+# deviance_means = df_deviance.mean(axis=0)
+#
+# dev_means_tup = zip(deviance_means, subject_deviance_cols)
+# sorted_dev_means_tup = sorted(dev_means_tup, reverse=True)
+# sorted_means = [item[0] for item in sorted_dev_means_tup]
+# sorted_regions = [item[1] for item in sorted_dev_means_tup]
+#
+# plt.bar(x=sorted_regions[:50], height=sorted_means[:50], color='blue')
+# plt.xlabel('ROI')
+# plt.ylabel('Average deviance')
+# plt.title('Average deviance over 606 participants (Raw values)')
+# plt.xticks(rotation=45, ha='right')
+# plt.tight_layout()
+# plt.show()
+#
+# print('')
